@@ -1,0 +1,175 @@
+'use strict';
+const http=require('http'),fs=require('fs'),path=require('path');
+const E=process.env,num=(k,d)=>(E[k]!==undefined&&E[k]!==''?+E[k]:d);
+const cfg={
+  pairs:(E.PAIRS||'XBTUSD,ETHUSD').split(',').map(s=>s.trim()),
+  tf:num('TF',15),bal:num('START_BAL',10000),risk:num('RISK_PCT',1),fee:num('FEE_PCT',0.26),
+  thr:num('THRESHOLD',0.3),sl:num('SL_ATR',1.5),tp:num('TP_ATR',3),
+  shorts:E.SHORTS!=='false',learn:E.LEARN!=='false',poll:num('POLL_SEC',30)
+};
+const DIR=E.DATA_DIR||'./data',FILE=path.join(DIR,'state.json');
+const DEF_W={trend:1,rsi:1,macd:1,bb:1,vol:.5};
+const clamp=(x,a,b)=>Math.max(a,Math.min(b,x)),sleep=ms=>new Promise(r=>setTimeout(r,ms));
+
+/* ---------- state ---------- */
+const newAcct=pair=>({pair,cash:cfg.bal,start:cfg.bal,pos:null,trades:[],weights:{...DEF_W},lastT:0,px:0,sig:null,err:null});
+let S={accts:{},log:[]};
+try{S=Object.assign(S,JSON.parse(fs.readFileSync(FILE,'utf8')))}catch(e){}
+function save(){try{fs.mkdirSync(DIR,{recursive:true});fs.writeFileSync(FILE+'.tmp',JSON.stringify(S));fs.renameSync(FILE+'.tmp',FILE)}catch(e){console.error('save failed',e.message)}}
+async function note(msg){
+  console.log(new Date().toISOString(),msg);
+  S.log.push({t:Date.now(),msg});S.log=S.log.slice(-200);
+  if(E.TG_TOKEN&&E.TG_CHAT)try{await fetch('https://api.telegram.org/bot'+E.TG_TOKEN+'/sendMessage',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({chat_id:E.TG_CHAT,text:msg})})}catch(e){}
+}
+
+/* ---------- indicators ---------- */
+function ema(a,n){const k=2/(n+1),o=[];let p=a[0];for(let i=0;i<a.length;i++){p=i?a[i]*k+p*(1-k):a[0];o.push(p)}return o}
+function wilder(a,n){const o=[];let p=a[0];for(let i=0;i<a.length;i++){p=i<n?(i?(p*i+a[i])/(i+1):a[0]):(p*(n-1)+a[i])/n;o.push(p)}return o}
+function rsi(c,n=14){const o=Array(c.length).fill(50);let g=0,l=0;for(let i=1;i<c.length;i++){const d=c[i]-c[i-1],u=Math.max(d,0),dn=Math.max(-d,0);if(i<=n){g+=u;l+=dn;if(i===n){g/=n;l/=n;o[i]=l?100-100/(1+g/l):100}}else{g=(g*(n-1)+u)/n;l=(l*(n-1)+dn)/n;o[i]=l?100-100/(1+g/l):100}}return o}
+function calc(C){
+  const cl=C.map(x=>x.c),n=C.length,f=ema(cl,12),s=ema(cl,26);
+  const macd=f.map((v,i)=>v-s[i]),sg=ema(macd,9),hist=macd.map((v,i)=>v-sg[i]);
+  const tr=C.map((x,i)=>i?Math.max(x.h-x.l,Math.abs(x.h-C[i-1].c),Math.abs(x.l-C[i-1].c)):x.h-x.l);
+  const bbm=[],bbs=[],vavg=[];
+  for(let i=0;i<n;i++){const fr=Math.max(0,i-19),w=cl.slice(fr,i+1),m=w.reduce((a,b)=>a+b,0)/w.length;
+    bbm.push(m);bbs.push(Math.sqrt(w.reduce((a,b)=>a+(b-m)**2,0)/w.length));
+    const vw=C.slice(fr,i+1);vavg.push(vw.reduce((a,b)=>a+b.v,0)/vw.length)}
+  return{cl,e21:ema(cl,21),e50:ema(cl,50),hist,r:rsi(cl),at:wilder(tr,14),bbm,bbs,vavg};
+}
+
+/* ---------- signal engine ---------- */
+function comps(I,C,i){
+  const a=I.at[i]||1e-9,k=C[i],up=I.bbm[i]+2*I.bbs[i],lo=I.bbm[i]-2*I.bbs[i];
+  const pb=up===lo?.5:(k.c-lo)/(up-lo),vr=I.vavg[i]?k.v/I.vavg[i]:1;
+  return{
+    trend:clamp((I.e21[i]-I.e50[i])/a/1.5,-1,1),
+    rsi:clamp((50-I.r[i])/20,-1,1),
+    macd:clamp(I.hist[i]/(a*.25),-1,1),
+    bb:clamp((.5-pb)*2,-1,1),
+    vol:Math.sign(k.c-k.o)*clamp(vr-1,0,1)
+  };
+}
+function signal(w,cm){
+  let s=0,t=0;for(const k in w){s+=w[k]*cm[k];t+=w[k]}s/=t;
+  let side=s>=cfg.thr?1:s<=-cfg.thr?-1:0;
+  if(side&&Object.values(cm).filter(v=>Math.sign(v)===side&&Math.abs(v)>.15).length<3)side=0;
+  return{s,side};
+}
+
+/* ---------- paper broker ---------- */
+const f=n=>n>=100?n.toFixed(2):n.toFixed(4);
+function open(a,side,price,atr,t,cm,s){
+  const entry=price*(1+side*.0005),dist=atr*cfg.sl;if(!(dist>0))return;
+  const qty=Math.min(a.cash*cfg.risk/100/dist,a.cash/entry*.98);if(qty<=0)return;
+  const fee=qty*entry*cfg.fee/100;a.cash-=fee;
+  a.pos={side,entry,qty,sl:entry-side*dist,tp:entry+side*atr*cfg.tp,t,comps:cm,fee};
+  note((side===1?'🟢 PAPER LONG ':'🔴 PAPER SHORT ')+a.pair+' @ '+f(entry)+'\nSL '+f(a.pos.sl)+' · TP '+f(a.pos.tp)+' · score '+s.toFixed(2));
+}
+function close(a,price,t,why){
+  const p=a.pos,exit=price*(1-p.side*.0005),fee=p.qty*exit*cfg.fee/100,gross=(exit-p.entry)*p.qty*p.side;
+  a.cash+=gross-fee;const net=gross-fee-p.fee;
+  a.trades.push({side:p.side,entry:p.entry,exit,qty:p.qty,net,why,t0:p.t,t1:t});
+  a.trades=a.trades.slice(-500);
+  if(cfg.learn)for(const k in a.weights)a.weights[k]=clamp(a.weights[k]+.08*(net>0?1:-1)*p.comps[k]*p.side,.2,2.5);
+  note((net>=0?'✅ ':'🔻 ')+'CLOSED '+(p.side===1?'LONG ':'SHORT ')+a.pair+' ('+why+')\n'+f(p.entry)+' → '+f(exit)+' · net $'+net.toFixed(2));
+  a.pos=null;
+}
+function manage(a,k){
+  const p=a.pos;if(!p||k.t<=p.t)return;
+  const sl=p.side===1?k.l<=p.sl:k.h>=p.sl,tp=p.side===1?k.h>=p.tp:k.l<=p.tp;
+  if(sl)close(a,p.sl,k.t,'STOP');else if(tp)close(a,p.tp,k.t,'TARGET');
+}
+function step(a,C,I,i){
+  const k=C[i];manage(a,k);
+  const cm=comps(I,C,i),{s,side}=signal(a.weights,cm);
+  if(a.pos&&side===-a.pos.side)close(a,k.c,k.t,'REVERSAL');
+  if(!a.pos&&side&&(side===1||cfg.shorts))open(a,side,k.c,I.at[i],k.t,cm,s);
+}
+const equity=a=>a.cash+(a.pos&&a.px?(a.px-a.pos.entry)*a.pos.qty*a.pos.side:0);
+
+/* ---------- data + loop ---------- */
+async function load(pair){
+  const r=await fetch('https://api.kraken.com/0/public/OHLC?pair='+pair+'&interval='+cfg.tf);
+  const j=await r.json();if(j.error&&j.error.length)throw new Error(j.error.join(', '));
+  const key=Object.keys(j.result).find(k=>k!=='last');
+  return j.result[key].map(x=>({t:x[0],o:+x[1],h:+x[2],l:+x[3],c:+x[4],v:+x[6]}));
+}
+async function runPair(pair){
+  const a=S.accts[pair]||(S.accts[pair]=newAcct(pair));
+  const rows=await load(pair),live=rows[rows.length-1],C=rows.slice(0,-1),I=calc(C),n=C.length-1;
+  if(!a.lastT||C[n].t-a.lastT>cfg.tf*60*2){ // fresh start or long downtime: don't trade stale history
+    if(a.pos)for(const k of C)if(a.pos)manage(a,k);
+    a.lastT=C[n].t;
+  }else{
+    for(let i=60;i<C.length;i++)if(C[i].t>a.lastT){step(a,C,I,i);a.lastT=C[i].t}
+  }
+  const px=live.c;a.px=px;
+  const p=a.pos;
+  if(p){
+    if(p.side===1?px<=p.sl:px>=p.sl)close(a,p.sl,Date.now()/1e3,'STOP');
+    else if(p.side===1?px>=p.tp:px<=p.tp)close(a,p.tp,Date.now()/1e3,'TARGET');
+  }
+  const cm=comps(I,C,n);a.sig={...signal(a.weights,cm),cm};a.err=null;a.updated=Date.now();
+}
+async function cycle(){
+  for(const p of cfg.pairs){
+    try{await runPair(p)}catch(e){(S.accts[p]||(S.accts[p]=newAcct(p))).err=e.message;console.error(p,e.message)}
+    await sleep(600);
+  }
+  save();setTimeout(cycle,cfg.poll*1000);
+}
+
+/* ---------- web ---------- */
+const view=()=>({
+  cfg,log:S.log.slice(-40).reverse(),
+  accts:Object.values(S.accts).map(a=>{
+    const w=a.trades.filter(t=>t.net>0),gl=Math.abs(a.trades.filter(t=>t.net<=0).reduce((s,t)=>s+t.net,0)),gw=w.reduce((s,t)=>s+t.net,0);
+    return{pair:a.pair,px:a.px,equity:equity(a),start:a.start,cash:a.cash,n:a.trades.length,
+      wr:a.trades.length?w.length/a.trades.length*100:0,pf:gl?gw/gl:null,weights:a.weights,err:a.err,updated:a.updated,
+      sig:a.sig&&{s:a.sig.s,side:a.sig.side,cm:a.sig.cm},
+      pos:a.pos&&{side:a.pos.side,entry:a.pos.entry,qty:a.pos.qty,sl:a.pos.sl,tp:a.pos.tp},
+      trades:a.trades.slice(-8).reverse()};
+  })
+});
+const PAGE=`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PAPERBOT 24/7</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=Space+Grotesk:wght@700&display=swap" rel="stylesheet">
+<style>body{margin:0;padding:12px;background:#0a0c0f;color:#c9d4e0;font:13px/1.5 'IBM Plex Mono',monospace}
+h1{font:700 20px 'Space Grotesk';margin:8px 0}h1 span{color:#2ee59d}.p{background:#10141a;border:1px solid #1e2630;border-radius:10px;padding:12px;margin:10px 0}
+.d{color:#6b7a8c}.g{color:#2ee59d}.r{color:#ff5370}.row{display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid #1e2630}
+.b{padding:2px 10px;border-radius:5px;border:1px solid #1e2630;font-weight:600}.BUY{color:#2ee59d;border-color:#2ee59d}.SELL{color:#ff5370;border-color:#ff5370}</style></head>
+<body><h1>PAPERBOT<span>//24-7</span></h1><div id="m" class="d">loading…</div><div id="o"></div><div class="p"><b>EVENTS</b><div id="l"></div></div>
+<script>
+var K=new URLSearchParams(location.search).get('key')||'',q=K?'?key='+encodeURIComponent(K):'';
+function f(n){return n>=100?n.toFixed(2):n.toFixed(4)}
+function m(n){return (n<0?'-':'')+'$'+Math.abs(n).toLocaleString(undefined,{maximumFractionDigits:2})}
+function cls(n){return n>=0?'g':'r'}
+async function go(){try{
+ var r=await fetch('/api/state'+q);if(!r.ok)throw new Error(r.status);var s=await r.json();
+ document.getElementById('m').textContent=s.cfg.tf+'m candles · risk '+s.cfg.risk+'% · threshold '+s.cfg.thr+' · refreshed '+new Date().toLocaleTimeString();
+ document.getElementById('o').innerHTML=s.accts.map(function(a){
+  var pnl=a.equity-a.start,side=a.sig?(a.sig.side===1?'BUY':a.sig.side===-1?'SELL':'HOLD'):'HOLD';
+  var pos=a.pos?'<div class="row"><span>'+(a.pos.side===1?'<b class="g">LONG</b>':'<b class="r">SHORT</b>')+' @ '+f(a.pos.entry)+'</span><span class="d">SL '+f(a.pos.sl)+' · TP '+f(a.pos.tp)+'</span></div>':'<div class="d">flat</div>';
+  var tr=a.trades.map(function(t){return '<div class="row"><span>'+(t.side===1?'L':'S')+' '+f(t.entry)+'→'+f(t.exit)+' <span class="d">'+t.why+'</span></span><span class="'+cls(t.net)+'">'+m(t.net)+'</span></div>'}).join('');
+  return '<div class="p"><div class="row"><b>'+a.pair+' '+(a.px?f(a.px):'—')+'</b><span class="b '+side+'">'+side+(a.sig?' '+a.sig.s.toFixed(2):'')+'</span></div>'
+   +'<div class="row"><span>Equity</span><span>'+m(a.equity)+' (<span class="'+cls(pnl)+'">'+(pnl/a.start*100).toFixed(2)+'%</span>)</span></div>'
+   +'<div class="row"><span>Trades / win / PF</span><span>'+a.n+' / '+a.wr.toFixed(0)+'% / '+(a.pf===null?'—':a.pf.toFixed(2))+'</span></div>'
+   +'<div class="d" style="font-size:11px">weights '+Object.keys(a.weights).map(function(k){return k+' '+a.weights[k].toFixed(2)}).join(' · ')+'</div>'
+   +(a.err?'<div class="r">'+a.err+'</div>':'')+pos+tr+'</div>'}).join('');
+ document.getElementById('l').innerHTML=s.log.map(function(e){return '<div class="row"><span>'+e.msg.replace(/\\n/g,' · ')+'</span></div>'}).join('')||'<span class="d">no trades yet</span>';
+}catch(e){document.getElementById('m').textContent='error: '+e.message}}
+go();setInterval(go,10000);
+</script></body></html>`;
+
+http.createServer((req,res)=>{
+  const u=new URL(req.url,'http://x'),ok=!E.DASH_KEY||u.searchParams.get('key')===E.DASH_KEY;
+  if(u.pathname==='/health'){res.end('ok');return}
+  if(!ok){res.writeHead(401);res.end('unauthorized');return}
+  if(u.pathname==='/api/state'){res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify(view()));return}
+  if(u.pathname==='/api/reset'&&req.method==='POST'){
+    if(!E.DASH_KEY){res.writeHead(403);res.end('set DASH_KEY to enable reset');return}
+    S={accts:{},log:[]};save();res.end('reset');return;
+  }
+  res.writeHead(200,{'content-type':'text/html'});res.end(PAGE);
+}).listen(num('PORT',3000),()=>console.log('paperbot up',JSON.stringify(cfg)));
+cycle();
